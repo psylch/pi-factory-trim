@@ -1,0 +1,36 @@
+{
+  "name": "pi-factory-trim",
+  "version": "0.1.0",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.2.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  },
+  "description": "pi extension that trims old images and huge tool output before requests to Factory (via magpie) to avoid 413 Request Entity Too Large",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "factory",
+    "magpie",
+    "413"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/psylch/pi-factory-trim.git"
+  }
+}

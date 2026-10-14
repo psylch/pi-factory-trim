@@ -1,0 +1,5 @@
+node_modules/
+.npm-cache/
+codex-run.log
+*.log
+.env

@@ -3,3 +3,4 @@ node_modules/
 codex-run.log
 *.log
 .env
+SPEC.md

@@ -9,7 +9,9 @@
   },
   "scripts": {
     "test": "tsx --test test/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "measure": "tsx test/measure.ts",
+    "fixtures": "python3 test/fixtures/generate.py"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

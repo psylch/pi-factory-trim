@@ -9,7 +9,11 @@ export interface ExtensionOptions {
 }
 
 function notify(ctx: ExtensionContext, message: string) {
-  if (!ctx.hasUI) return;
+  if (!ctx.hasUI) {
+    // Print/RPC mode has no UI; opt-in stderr logging keeps stdout clean.
+    if (process.env.PI_FACTORY_TRIM_LOG === "1") console.error(message);
+    return;
+  }
   try {
     ctx.ui.notify(message, "info");
   } catch { /* A UI failure must not discard a successful transformation. */ }
@@ -34,7 +38,11 @@ export function createExtension(options: ExtensionOptions = {}) {
         const compression = readCompressConfig(env);
         if (compression.enabled) {
           try {
-            const compressed = await compressImages(event.messages, compression, await loadResizer());
+            const compressed = await compressImages(
+              event.messages,
+              { ...compression, budgetBytes: config.budgetBytes, maxToolResultChars: config.maxToolResultChars },
+              await loadResizer(),
+            );
             // Compressed images are only dropped under budget pressure, never by count.
             const { messages, stats } = trimMessages(compressed.messages, { ...config, keepImages: Number.MAX_SAFE_INTEGER });
             const removed = compressed.stats.imagesRemoved + stats.imagesRemoved;

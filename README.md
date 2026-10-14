@@ -2,8 +2,9 @@
 
 A pi extension that reduces outgoing conversation size when the active model's
 `provider/id` matches `factory|magpie`. It re-encodes older inline images at a
-lower resolution (and drops them with `[image removed to fit request size]` only
-if compression fails or the request is still over budget), and shortens large
+lower resolution, compresses even the newest images further when the request is
+still too large, and drops images with `[image removed to fit request size]` only
+if compression fails or nothing else fits the budget. It also shortens large
 tool result text while preserving the beginning and end. Changes are
 request-local: saved sessions, assistant messages, tool call/result pairing, and
 user text remain intact.
@@ -41,8 +42,9 @@ Set environment variables before starting pi:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PI_FACTORY_TRIM_COMPRESS` | unset | Set exactly `0` to turn off image compression and use the drop-only behaviour. |
-| `PI_FACTORY_TRIM_KEEP_FULL` | `2` | The last N inline images are sent unchanged. |
+| `PI_FACTORY_TRIM_KEEP_FULL` | `2` | The last N inline images are sent unchanged, unless they exceed the per-image cap or the request is over budget. |
 | `PI_FACTORY_TRIM_TIER1_COUNT` | `3` | The next N older images are re-encoded at up to 1568px (JPEG quality 75); all older ones at up to 768px (quality 60). |
+| `PI_FACTORY_TRIM_MAX_IMAGE_BYTES` | `1000000` | Any image whose base64 data is longer than this is re-encoded at tier 1 (1568px, q75), even one of the last `KEEP_FULL`. |
 | `PI_FACTORY_TRIM_KEEP_IMAGES` | `3` | Drop-only mode (`PI_FACTORY_TRIM_COMPRESS=0`, or if compression cannot start): keep the last N inline images and replace older ones. Budget pressure can remove these too. |
 | `PI_FACTORY_TRIM_MAX_TOOL_CHARS` | `30000` | Initial per-block tool text limit. Keep 40% head and 40% tail plus a truncation marker. |
 | `PI_FACTORY_TRIM_BUDGET_BYTES` | `3500000` | Target UTF-8 bytes of `JSON.stringify(messages)`. |
@@ -60,7 +62,8 @@ headless use works without UI.
 ### Image compression
 
 Images in user and tool result messages are counted newest first. The newest
-`PI_FACTORY_TRIM_KEEP_FULL` stay byte-identical; older ones are re-encoded with
+`PI_FACTORY_TRIM_KEEP_FULL` stay byte-identical (unless over the per-image cap or
+the budget, see below); older ones are re-encoded with
 pi's own `resizeImage` (Photon/WASM, in a worker thread). pi's resizer returns
 its PNG candidate whenever that fits the byte limit, so the extension calls it
 with the original size as the limit and, if the result is a PNG, once more with
@@ -73,6 +76,22 @@ Results are cached in memory by SHA-256 of the image data plus tier (up to 200
 entries, least recently used evicted), so later turns don't re-encode. An image
 re-encodes once more when it ages from tier 1 into tier 2. The first encode
 costs roughly 1–2.5 s per large screenshot (see below); up to 4 run in parallel.
+
+A single image can be larger than the whole budget: pi's `read` tool re-encodes a
+2880x1800 screenshot into a PNG of about 3.9MB base64 (pi issue #10479). So any
+image over `PI_FACTORY_TRIM_MAX_IMAGE_BYTES`, including the newest ones, is
+re-encoded at tier 1. If the request (estimated after the initial tool text
+truncation) is still above `PI_FACTORY_TRIM_BUDGET_BYTES`, compression escalates
+before any image is dropped, re-measuring after each image and stopping as soon
+as the request fits:
+
+1. The `KEEP_FULL` images not yet compressed are re-encoded at tier 1, oldest first.
+2. Every tier-1 image is re-encoded at tier 2 (768px, q60) from its original, oldest first.
+
+Escalation results use the same cache. A failed or unhelpful escalation keeps
+what the image already had (the original or the tier-1 result); only older
+images fall back to the placeholder when compression fails. Each image counts
+once in "compressed", however many tiers it went through.
 
 Compressed images are never dropped by count. Afterwards the normal budget loop
 runs: if the request is still above `PI_FACTORY_TRIM_BUDGET_BYTES`, it removes
@@ -142,7 +161,9 @@ load pi's resize module directly from `node_modules`.
 
 图片压缩：最近 `PI_FACTORY_TRIM_KEEP_FULL`（默认 2）张图片原样发送；之后的
 `PI_FACTORY_TRIM_TIER1_COUNT`（默认 3）张用 pi 自带的 `resizeImage` 缩到 1568px、JPEG 质量 75；
-更旧的缩到 768px、质量 60。只有结果更小时才替换，结果按 SHA-256 缓存。压缩失败的图片替换为占位文字。
-若请求仍超过预算，再从最旧的图片开始删除。`PI_FACTORY_TRIM_COMPRESS=0` 恢复只删除不压缩的旧行为。
+更旧的缩到 768px、质量 60。只有结果更小时才替换，结果按 SHA-256 缓存。压缩失败的较旧图片替换为占位文字。
+base64 超过 `PI_FACTORY_TRIM_MAX_IMAGE_BYTES`（默认 1000000）的图片即使是最近的也按 1568px 压缩。
+若请求仍超过预算，先从最旧开始把最近的图片压到 1568px，再把 1568px 的图片压到 768px，
+每压一张重新计算大小，够了就停；仍超出时才从最旧的图片开始删除。`PI_FACTORY_TRIM_COMPRESS=0` 恢复只删除不压缩的旧行为。
 示例截图压缩后约为原来的 4%–50%（见上表）。
 默认 350 万字节只是估计，magpie 转换后的实际请求大小可能不同。

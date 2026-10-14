@@ -43,7 +43,8 @@ async function runHandler(messages: unknown[], env: NodeJS.ProcessEnv, loadResiz
 test("real resizeImage compresses older images and keeps the latest N byte-identical", async () => {
   const resizer = await loadRealResizer();
   const [small, large] = FIXTURES.map(fixture);
-  const input = [user([image(large), text("first")]), tool([image(small)]), tool([image(large)]), user([image(small), text("latest")])];
+  // Kept-full images stay under the default per-image cap so they are not compressed.
+  const input = [user([image(large), text("first")]), tool([image(small)]), tool([image(small)]), user([image(small), text("latest")])];
   const original = structuredClone(input);
   const { messages, stats } = await compressImages(input, { keepFull: 2 }, resizer);
   assert.deepEqual(stats, { imagesCompressed: 2, imagesRemoved: 0 });
@@ -166,22 +167,129 @@ test("extension compresses, keeps compressed images past the old count limit, an
   assert.deepEqual(unchanged.notes, []);
 });
 
-test("budget fallback still removes oldest images, compressed or not, after compression", async () => {
+test("budget fallback removes oldest images only after every image reached tier 2", async () => {
   const resizer = await loadRealResizer();
   const large = fixture(FIXTURES[1]);
   const input = [user([image(large)]), tool([image(large), text("x".repeat(40000))]), user([image(large)]), user([image(large), text("latest")])];
-  // About 3.23MB after compression (two ~265KB JPEGs, two 1.34MB originals); one removal fits.
-  const budget = 3_100_000;
+  // About 254KB with all four at tier 2 (~57KB each) plus 30K of tool text; one removal fits.
+  const budget = 210_000;
   const { result, notes } = await runHandler(input, { PI_FACTORY_TRIM_BUDGET_BYTES: String(budget) }, async () => resizer);
   const out = result!.messages as { content: { type: string; data?: string; text?: string }[] }[];
   const bytes = Buffer.byteLength(JSON.stringify(out));
   assert.ok(bytes <= budget, `${bytes} > ${budget}`);
   assert.deepEqual(out[0].content, [placeholder]);
-  assert.equal(out[1].content[0].type, "image");
-  assert.ok(out[1].content[0].data!.length < large.length / 3);
+  for (const block of [out[1].content[0], out[2].content[0], out[3].content[0]]) {
+    assert.deepEqual(imageSize(block.data!), { width: 768, height: 480 });
+  }
   assert.ok(out[1].content[1].text!.length < 40000);
-  assert.deepEqual(out.slice(2), input.slice(2));
-  assert.deepEqual(notes, [`Factory trim: compressed 2, removed 1, truncated 1; ${Buffer.byteLength(JSON.stringify(input))} → ${bytes} bytes`]);
+  assert.deepEqual(out[3].content[1], text("latest"));
+  // The removed image was compressed first, so it is counted in both numbers.
+  assert.deepEqual(notes, [`Factory trim: compressed 4, removed 1, truncated 1; ${Buffer.byteLength(JSON.stringify(input))} → ${bytes} bytes`]);
+});
+
+test("a single latest huge image is compressed under budget pressure instead of dropped", async () => {
+  const resizer = await loadRealResizer();
+  const large = fixture(FIXTURES[1]);
+  const input = [user([text("what is on screen?")]), tool([image(large)])];
+  const before = Buffer.byteLength(JSON.stringify(input));
+  // The cap is lifted so only the budget can trigger compression of the kept-full image.
+  const env = { PI_FACTORY_TRIM_MAX_IMAGE_BYTES: String(Number.MAX_SAFE_INTEGER) };
+  const cases = [{ budget: 1_000_000, size: { width: 1568, height: 980 } }, { budget: 100_000, size: { width: 768, height: 480 } }];
+  for (const { budget, size } of cases) {
+    const { result, notes } = await runHandler(input, { ...env, PI_FACTORY_TRIM_BUDGET_BYTES: String(budget) }, async () => resizer);
+    const out = result!.messages as { content: { type: string; data: string; mimeType: string }[] }[];
+    const bytes = Buffer.byteLength(JSON.stringify(out));
+    assert.ok(bytes <= budget, `${bytes} > ${budget}`);
+    assert.equal(out[1].content[0].type, "image");
+    assert.equal(out[1].content[0].mimeType, "image/jpeg");
+    assert.deepEqual(imageSize(out[1].content[0].data), size);
+    assert.deepEqual(notes, [`Factory trim: compressed 1, removed 0, truncated 0; ${before} → ${bytes} bytes`]);
+  }
+  const roomy = await runHandler(input, env, async () => resizer);
+  assert.equal(roomy.result, undefined);
+});
+
+/** Tier 1 results are 1000 chars, tier 2 results 100; calls are recorded as image letter + tier. */
+function tieredResizer(calls: string[], fail: (id: string, tier: number) => boolean = () => false): Resizer {
+  return async (bytes, _mimeType, options) => {
+    const id = Buffer.from(bytes).toString("base64")[0];
+    const tier = options.maxWidth === TIERS[1].maxWidth ? 1 : 2;
+    calls.push(`${id}${tier}`);
+    if (fail(id, tier)) return null;
+    return {
+      data: `${id}${tier}:`.padEnd(tier === 1 ? 1000 : 100, "x"),
+      mimeType: "image/jpeg",
+      width: options.maxWidth,
+      height: options.maxHeight,
+      originalWidth: options.maxWidth * 2,
+      originalHeight: options.maxHeight * 2,
+    };
+  };
+}
+
+test("escalation compresses kept-full images, then tier 1 to tier 2, oldest first, until under budget", async () => {
+  // A is tier 2 and B tier 1 by age; C and D are kept full. Originals are 10000 chars each.
+  const input = ["A", "B", "C", "D"].map((id) => user([image(id.repeat(10000))]));
+  const original = structuredClone(input);
+  const run = async (budgetBytes: number, fail?: (id: string, tier: number) => boolean) => {
+    const calls: string[] = [];
+    const { messages, stats } = await compressImages(input, { keepFull: 2, tier1Count: 1, budgetBytes }, tieredResizer(calls, fail));
+    const data = messages.map((m) => (m.content as { data?: string; text?: string }[])[0]);
+    return { calls, stats, prefixes: data.map((b) => b.data?.slice(0, 2) ?? b.text), bytes: Buffer.byteLength(JSON.stringify(messages)) };
+  };
+
+  const roomy = await run(100_000);
+  assert.deepEqual(roomy.calls, ["A2", "B1"]);
+  assert.deepEqual(roomy.prefixes, ["A2", "B1", "CC", "DD"]);
+
+  const one = await run(15_000);
+  assert.deepEqual(one.calls, ["A2", "B1", "C1"]);
+  assert.deepEqual(one.prefixes, ["A2", "B1", "C1", "DD"]);
+  assert.ok(one.bytes <= 15_000);
+
+  const tier2 = await run(3_000);
+  assert.deepEqual(tier2.calls, ["A2", "B1", "C1", "D1", "B2"]);
+  assert.deepEqual(tier2.prefixes, ["A2", "B2", "C1", "D1"]);
+  assert.ok(tier2.bytes <= 3_000);
+  // B went through two tiers but counts once.
+  assert.deepEqual(tier2.stats, { imagesCompressed: 4, imagesRemoved: 0 });
+
+  const exhausted = await run(0);
+  assert.deepEqual(exhausted.calls, ["A2", "B1", "C1", "D1", "B2", "C2", "D2"]);
+  assert.deepEqual(exhausted.prefixes, ["A2", "B2", "C2", "D2"]);
+  assert.deepEqual(exhausted.stats, { imagesCompressed: 4, imagesRemoved: 0 });
+
+  // Escalation failures keep the current image: a tier-1 result, or the kept-full original.
+  const failing = await run(0, (id, tier) => tier === 2 || id === "D");
+  assert.deepEqual(failing.prefixes, [IMAGE_PLACEHOLDER, "B1", "C1", "DD"]);
+  assert.deepEqual(failing.stats, { imagesCompressed: 2, imagesRemoved: 1 });
+  assert.deepEqual(input, original);
+});
+
+test("kept-full images over the per-image cap are compressed at tier 1 regardless of budget", async () => {
+  const calls: string[] = [];
+  const input = [user([image("A".repeat(10000))]), user([image("B".repeat(2000)), image("C".repeat(1000))])];
+  // All three are kept full; only those strictly over the cap are compressed.
+  const { messages, stats } = await compressImages(input, { keepFull: 3, maxImageBytes: 1000 }, tieredResizer(calls));
+  assert.deepEqual(calls, ["A1", "B1"]);
+  assert.deepEqual(stats, { imagesCompressed: 2, imagesRemoved: 0 });
+  assert.equal((messages[1].content as { data: string }[])[0].data.slice(0, 2), "B1");
+  assert.deepEqual((messages[1].content as unknown[])[1], (input[1].content as unknown[])[1]);
+
+  // A failed capped image is still sent rather than replaced by the placeholder.
+  const failed = await compressImages(input, { keepFull: 3, maxImageBytes: 1000 }, async () => null);
+  assert.deepEqual(failed, { messages: input, stats: { imagesCompressed: 0, imagesRemoved: 0 } });
+
+  // Default 1MB cap with the real resizer: the 1.34MB fixture is compressed, the 484KB one is not.
+  const resizer = await loadRealResizer();
+  const [small, large] = FIXTURES.map(fixture);
+  const real = [tool([image(small)]), user([image(large), text("latest")])];
+  const { result, notes } = await runHandler(real, {}, async () => resizer);
+  const out = result!.messages as { content: { type: string; data?: string }[] }[];
+  assert.deepEqual(out[0], real[0]);
+  assert.deepEqual(imageSize(out[1].content[0].data!), { width: 1568, height: 980 });
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /^Factory trim: compressed 1, removed 0, truncated 0;/);
 });
 
 test("PI_FACTORY_TRIM_COMPRESS=0 and resizer load failures use the old trim exactly", async () => {
@@ -201,7 +309,13 @@ test("PI_FACTORY_TRIM_COMPRESS=0 and resizer load failures use the old trim exac
 });
 
 test("compression configuration defaults, overrides and invalid numbers", () => {
-  assert.deepEqual(readCompressConfig({}), { enabled: true, keepFull: 2, tier1Count: 3 });
-  assert.deepEqual(readCompressConfig({ PI_FACTORY_TRIM_COMPRESS: "0", PI_FACTORY_TRIM_KEEP_FULL: "5", PI_FACTORY_TRIM_TIER1_COUNT: "0" }), { enabled: false, keepFull: 5, tier1Count: 0 });
-  assert.deepEqual(readCompressConfig({ PI_FACTORY_TRIM_COMPRESS: "1", PI_FACTORY_TRIM_KEEP_FULL: "-1", PI_FACTORY_TRIM_TIER1_COUNT: "x" }), { enabled: true, keepFull: 2, tier1Count: 3 });
+  assert.deepEqual(readCompressConfig({}), { enabled: true, keepFull: 2, tier1Count: 3, maxImageBytes: 1_000_000 });
+  assert.deepEqual(
+    readCompressConfig({ PI_FACTORY_TRIM_COMPRESS: "0", PI_FACTORY_TRIM_KEEP_FULL: "5", PI_FACTORY_TRIM_TIER1_COUNT: "0", PI_FACTORY_TRIM_MAX_IMAGE_BYTES: "250000" }),
+    { enabled: false, keepFull: 5, tier1Count: 0, maxImageBytes: 250_000 },
+  );
+  assert.deepEqual(
+    readCompressConfig({ PI_FACTORY_TRIM_COMPRESS: "1", PI_FACTORY_TRIM_KEEP_FULL: "-1", PI_FACTORY_TRIM_TIER1_COUNT: "x", PI_FACTORY_TRIM_MAX_IMAGE_BYTES: "1e" }),
+    { enabled: true, keepFull: 2, tier1Count: 3, maxImageBytes: 1_000_000 },
+  );
 });

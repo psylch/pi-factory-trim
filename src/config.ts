@@ -24,5 +24,6 @@ export function readCompressConfig(env: NodeJS.ProcessEnv = process.env): Compre
     enabled: env.PI_FACTORY_TRIM_COMPRESS !== "0",
     keepFull: readNumber(env, "PI_FACTORY_TRIM_KEEP_FULL", COMPRESS_DEFAULTS.keepFull),
     tier1Count: readNumber(env, "PI_FACTORY_TRIM_TIER1_COUNT", COMPRESS_DEFAULTS.tier1Count),
+    maxImageBytes: readNumber(env, "PI_FACTORY_TRIM_MAX_IMAGE_BYTES", COMPRESS_DEFAULTS.maxImageBytes),
   };
 }
